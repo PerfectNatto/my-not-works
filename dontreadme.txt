@@ -10,7 +10,7 @@ loop Session lifecycle (forced disconnect after 2h -> reconnect)
   S-->>ClientA: WS Connected + sessionIdA
   ClientA->>ClientA: store sessionIdA
 
-  Note over ClientA,S: 2) ClientA queries ClientB connection status via WS message\nIf connected, store sessionIdB as destination\nIf not, wait for a "ClientB connected" notification
+  Note over ClientA,S: 2) ClientA queries ClientB connection status via WS message<br/>If connected, store sessionIdB as destination<br/>If not, wait for a "ClientB connected" notification
   ClientA->>S: WS Send CHECK_CLIENT_CONNECTED { targetClient: "clientB" }
   alt ClientB already connected
     S-->>ClientA: WS Reply CLIENT_CONNECTED { sessionIdB }
@@ -49,7 +49,7 @@ loop Session lifecycle (forced disconnect after 2h -> reconnect)
     end
   end
 
-  Note over ClientA,ClientB,S: 6) Even with pings, connection closes after 2h -> go back to step 1
+  Note over ClientA,ClientB: 6) Even with pings, Server closes both connections after 2h -> go back to step 1
   S-->>ClientA: WS Close (2h limit)
   S-->>ClientB: WS Close (2h limit)
   ClientA->>ClientA: detect close -> prepare reconnect
