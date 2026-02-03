@@ -1,4 +1,4 @@
-# ts_pt_to_pte.py
+# ts_pt_to_pte_draft_export.py
 import argparse
 from pathlib import Path
 
@@ -6,30 +6,16 @@ import torch
 
 
 def parse_shape(s: str):
-    # "1,2,44100" -> (1,2,44100)
-    parts = [p.strip() for p in s.split(",")]
-    return tuple(int(p) for p in parts if p)
+    return tuple(int(p.strip()) for p in s.split(",") if p.strip())
 
 
 class TorchScriptModuleWrapper(torch.nn.Module):
-    """
-    TorchScript(ScriptModule) を torch.export の入口として扱うためのラッパーです。
-    forward は ts(*args) をそのまま呼びます。
-    """
     def __init__(self, ts_module):
         super().__init__()
         self.ts = ts_module
 
     def forward(self, x):
         return self.ts(x)
-
-
-def torch_export(module: torch.nn.Module, example_inputs: tuple):
-    # PyTorch のバージョン差分対策（strict 引数が無い場合がある）
-    try:
-        return torch.export.export(module, example_inputs, strict=False)
-    except TypeError:
-        return torch.export.export(module, example_inputs)
 
 
 def main():
@@ -46,21 +32,24 @@ def main():
     ts = torch.jit.load(str(pt_path), map_location="cpu")
     ts.eval()
 
-    # 2) torch.export できる形にラップ
+    # 2) export 入口用ラップ
     wrapper = TorchScriptModuleWrapper(ts).eval()
 
-    # 3) 例入力（trace時と同じshapeにすること）
+    # 3) 例入力（trace時と同じshape）
     x = torch.randn(*parse_shape(args.input_shape), dtype=torch.float32)
     example_inputs = (x,)
 
-    # 4) torch.export -> Edge -> ExecuTorch
-    exported = torch_export(wrapper, example_inputs)
+    # 4) draft_export（data-dependent を実テンソル併用で通す）
+    ep = torch.export.draft_export(wrapper, example_inputs)
 
+    # 必要ならレポート表示（邪魔なら消してOK）
+    # print(ep._report)
+
+    # 5) ExecuTorch へ
     import executorch.exir as exir
-    edge = exir.to_edge(exported)
+    edge = exir.to_edge(ep)
     et = edge.to_executorch()
 
-    # 5) .pte 書き出し
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
         if hasattr(et, "write_to_file"):
