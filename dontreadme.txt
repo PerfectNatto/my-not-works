@@ -1,67 +1,76 @@
-# ts_pt_to_executorch.py
+# demucs_ts_pt_to_executorch.py
 import argparse
 from pathlib import Path
-
 import torch
 
-def _parse_shape(s: str):
-    # "1,3,224,224" -> (1,3,224,224)
+def parse_shape(s: str):
+    # "1,2,44100" -> (1,2,44100)
     return tuple(int(x.strip()) for x in s.split(",") if x.strip())
+
+class TSWrapper(torch.nn.Module):
+    """torch.export が ScriptModule を直で嫌う場合の回避用（それでも落ちることはあります）"""
+    def __init__(self, ts):
+        super().__init__()
+        self.ts = ts
+
+    def forward(self, x):
+        return self.ts(x)
+
+def do_torch_export(model, example_inputs, strict: bool):
+    # PyTorchのバージョン差分に備えて strict 引数あり/なし両対応
+    try:
+        return torch.export.export(model, example_inputs, strict=strict)
+    except TypeError:
+        return torch.export.export(model, example_inputs)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pt", required=True, help="TorchScript .pt saved by torch.jit.save")
+    ap.add_argument("--pt", required=True, help="TorchScript .pt (saved by torch.jit.save)")
     ap.add_argument("--out", required=True, help="output .pte path")
-    ap.add_argument("--input-shape", default="1,3,224,224", help='e.g. "1,3,224,224" (single tensor input)')
+    ap.add_argument("--input-shape", default="1,2,44100", help='e.g. "1,2,44100"')
     ap.add_argument("--backend", choices=["none", "xnnpack"], default="none")
-    ap.add_argument("--strict", action="store_true", help="strict load_state_dict (default: False)")
+    ap.add_argument("--strict-export", action="store_true", help="use strict=True in torch.export when supported")
     args = ap.parse_args()
 
     pt_path = Path(args.pt)
     out_path = Path(args.out)
 
-    # 1) TorchScript をロード（torch.jit.save された .pt 想定）
+    # 1) TorchScript をロード
     ts = torch.jit.load(str(pt_path), map_location="cpu")
     ts.eval()
 
-    # 2) TorchScript から state_dict を抜く（= 重みを取り出す）
-    sd = ts.state_dict()
-    if not isinstance(sd, dict) or len(sd) == 0:
-        raise RuntimeError("TorchScriptから state_dict を取得できませんでした（空です）。")
+    # 2) ダミー入力（Demucs想定で (B, C, T) をデフォルトにしています）
+    shape = parse_shape(args.input_shape)
+    x = torch.randn(*shape, dtype=torch.float32)
+    example_inputs = (x,)
 
-    # 3) 元の nn.Module を生成して重みをロード（ここだけ差し替え）
-    # ===== ここをあなたの実装に差し替え =====
-    # from your_model_file import MyModel
-    # model = MyModel(...).eval()
-    raise NotImplementedError("ここで元の nn.Module（MyModel）の生成に差し替えてください")
-    # =========================================
+    # 3) torch.export（まず直で試して、ダメなら wrapper を試す）
+    try:
+        ep = do_torch_export(ts, example_inputs, strict=args.strict_export)
+    except Exception as e1:
+        wrapped = TSWrapper(ts).eval()
+        try:
+            ep = do_torch_export(wrapped, example_inputs, strict=args.strict_export)
+        except Exception as e2:
+            raise RuntimeError(
+                "TorchScript(.pt) -> torch.export が失敗しました。\n"
+                "これはよくあるパターンで、ExecuTorch の標準入口が eager nn.Module を前提にしているためです。\n"
+                f"[direct error]\n{e1}\n\n[wrapper error]\n{e2}\n"
+            ) from e2
 
-    missing, unexpected = model.load_state_dict(sd, strict=args.strict)
-    if missing:
-        print("[warn] missing keys (first 30):", missing[:30])
-    if unexpected:
-        print("[warn] unexpected keys (first 30):", unexpected[:30])
-
-    # 4) torch.export（ExecuTorchの入口）
-    shape = _parse_shape(args.input_shape)
-    example_inputs = (torch.randn(*shape),)
-    exported = torch.export.export(model, example_inputs)
-
-    # 5) ExecuTorch .pte 書き出し（必要ならXNNPACK lowering）
+    # 4) ExecuTorch へ（必要なら XNNPACK lowering）
     if args.backend == "xnnpack":
         from executorch.exir import to_edge_transform_and_lower
         from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
-
-        edge = to_edge_transform_and_lower(exported, partitioner=[XnnpackPartitioner()])
+        edge = to_edge_transform_and_lower(ep, partitioner=[XnnpackPartitioner()])
     else:
         import executorch.exir as exir
-        edge = exir.to_edge(exported)
+        edge = exir.to_edge(ep)
 
     et = edge.to_executorch()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
-        # write_to_file があればコピーが増えにくい（無ければ buffer を書く）
         if hasattr(et, "write_to_file"):
             et.write_to_file(f)
         else:
