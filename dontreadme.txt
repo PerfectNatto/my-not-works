@@ -1,57 +1,73 @@
-sequenceDiagram
-autonumber
-actor ClientA
-actor ClientB
-participant S as Server
+# ts_pt_to_executorch.py
+import argparse
+from pathlib import Path
 
-loop Session lifecycle (forced disconnect after 2h -> reconnect)
-  Note over ClientA,S: 1) ClientA connects via WSS using URL query params (client name, userId)
-  ClientA->>S: WS Connect wss://.../ws?client=clientA&userId=...
-  S-->>ClientA: WS Connected + sessionIdA
-  ClientA->>ClientA: store sessionIdA
+import torch
 
-  Note over ClientA,S: 2) ClientA queries ClientB connection status via WS message<br/>If connected, store sessionIdB as destination<br/>If not, wait for a "ClientB connected" notification
-  ClientA->>S: WS Send CHECK_CLIENT_CONNECTED { targetClient: "clientB" }
-  alt ClientB already connected
-    S-->>ClientA: WS Reply CLIENT_CONNECTED { sessionIdB }
-    ClientA->>ClientA: store sessionIdB as destination
-  else ClientB not connected yet
-    S-->>ClientA: WS Reply CLIENT_NOT_CONNECTED
-    ClientA->>S: WS Send SUBSCRIBE_CLIENT_CONNECTED { targetClient: "clientB" }
-    Note over ClientA,S: wait until ClientB connects
+def _parse_shape(s: str):
+    # "1,3,224,224" -> (1,3,224,224)
+    return tuple(int(x.strip()) for x in s.split(",") if x.strip())
 
-    ClientB->>S: WS Connect wss://.../ws?client=clientB&userId=...
-    S-->>ClientB: WS Connected + sessionIdB
-    ClientB->>ClientB: store sessionIdB
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pt", required=True, help="TorchScript .pt saved by torch.jit.save")
+    ap.add_argument("--out", required=True, help="output .pte path")
+    ap.add_argument("--input-shape", default="1,3,224,224", help='e.g. "1,3,224,224" (single tensor input)')
+    ap.add_argument("--backend", choices=["none", "xnnpack"], default="none")
+    ap.add_argument("--strict", action="store_true", help="strict load_state_dict (default: False)")
+    args = ap.parse_args()
 
-    S-->>ClientA: WS Push CLIENT_CONNECTED { sessionIdB }
-    ClientA->>ClientA: store sessionIdB as destination
-  end
+    pt_path = Path(args.pt)
+    out_path = Path(args.out)
 
-  Note over ClientA,ClientB: 3) After pairing, ClientA sends initialization data to ClientB
-  ClientA->>S: WS Send INIT_DATA { to: sessionIdB, payload: ... }
-  S-->>ClientB: WS Deliver INIT_DATA
+    # 1) TorchScript をロード（torch.jit.save された .pt 想定）
+    ts = torch.jit.load(str(pt_path), map_location="cpu")
+    ts.eval()
 
-  Note over ClientA,ClientB: 4) Then ClientA and ClientB exchange messages
-  par Message exchange (as needed)
-    loop as needed
-      ClientA->>S: WS Send MESSAGE { to: sessionIdB, payload: ... }
-      S-->>ClientB: WS Deliver MESSAGE
-      ClientB->>S: WS Send MESSAGE { to: sessionIdA, payload: ... }
-      S-->>ClientA: WS Deliver MESSAGE
-    end
-  and 5) Keep-alive: disconnect after 10 min idle, so send ping about every 10 min
-    loop every ~10 min
-      ClientA->>S: WS Ping
-      S-->>ClientA: Pong (optional)
-      ClientB->>S: WS Ping
-      S-->>ClientB: Pong (optional)
-    end
-  end
+    # 2) TorchScript から state_dict を抜く（= 重みを取り出す）
+    sd = ts.state_dict()
+    if not isinstance(sd, dict) or len(sd) == 0:
+        raise RuntimeError("TorchScriptから state_dict を取得できませんでした（空です）。")
 
-  Note over ClientA,ClientB: 6) Even with pings, Server closes both connections after 2h -> go back to step 1
-  S-->>ClientA: WS Close (2h limit)
-  S-->>ClientB: WS Close (2h limit)
-  ClientA->>ClientA: detect close -> prepare reconnect
-  ClientB->>ClientB: detect close -> prepare reconnect
-end
+    # 3) 元の nn.Module を生成して重みをロード（ここだけ差し替え）
+    # ===== ここをあなたの実装に差し替え =====
+    # from your_model_file import MyModel
+    # model = MyModel(...).eval()
+    raise NotImplementedError("ここで元の nn.Module（MyModel）の生成に差し替えてください")
+    # =========================================
+
+    missing, unexpected = model.load_state_dict(sd, strict=args.strict)
+    if missing:
+        print("[warn] missing keys (first 30):", missing[:30])
+    if unexpected:
+        print("[warn] unexpected keys (first 30):", unexpected[:30])
+
+    # 4) torch.export（ExecuTorchの入口）
+    shape = _parse_shape(args.input_shape)
+    example_inputs = (torch.randn(*shape),)
+    exported = torch.export.export(model, example_inputs)
+
+    # 5) ExecuTorch .pte 書き出し（必要ならXNNPACK lowering）
+    if args.backend == "xnnpack":
+        from executorch.exir import to_edge_transform_and_lower
+        from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+
+        edge = to_edge_transform_and_lower(exported, partitioner=[XnnpackPartitioner()])
+    else:
+        import executorch.exir as exir
+        edge = exir.to_edge(exported)
+
+    et = edge.to_executorch()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        # write_to_file があればコピーが増えにくい（無ければ buffer を書く）
+        if hasattr(et, "write_to_file"):
+            et.write_to_file(f)
+        else:
+            f.write(et.buffer)
+
+    print("wrote:", str(out_path))
+
+if __name__ == "__main__":
+    main()
